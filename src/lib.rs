@@ -1,7 +1,6 @@
 mod kv_store;
 pub use kv_store::KvStore;
 
-
 #[cfg(test)]
 mod tests {
     #[test]
