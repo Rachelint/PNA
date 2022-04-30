@@ -1,69 +1,77 @@
 mod log_file;
 
-use log::{warn, info, error};
-use snafu::{Location, Snafu, location};
-use std::{collections::HashMap, path::{PathBuf, Path}};
+use log::{error, info, warn, debug};
+use snafu::{Location, Snafu, ResultExt};
+use std::{
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
+
+use self::log_file::LogFile;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{} Init KvStore path:{} not found", location, path.display()))]
-    InitStore {
-        location: Location,
-        path: PathBuf,
-    },
+    #[snafu(display("{} Init store path {} not found", location, path.display()))]
+    Open { source:log_file::Error, location: Location, path: PathBuf },
+
+    #[snafu(display("{} set {} {} in store: {}", location, key, value, source))]
+    Set { source:log_file::Error, location: Location, key: String, value: String },
+
+    // #[snafu(display("{} get {} in store: {}", location, key, source))]
+    // Get { source:log_file::Error, location: Location, key: String},
+
+    #[snafu(display("{} rm {} in store: {}", location, key, source))]
+    Rm { source:log_file::Error, location: Location, key: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct KvStore {
-    mem_store: HashMap<String, String>,
+    log_file: LogFile,
 }
 impl KvStore {
     // open
-    pub fn open(path: impl Into<PathBuf>) -> Result<()> {
+    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path: PathBuf = path.into();
+        info!("kv_store open from path:{}", path.display());
+
+        let log_file = LogFile::new(path.as_path())
+            .context(OpenSnafu{path})?;
+        // just use one log file
+        Ok(KvStore {
+            log_file,
+        })
+
         // check path's valid
         // walk around the dir and get files
-        let res = get_file_paths(path.as_path());
-        if res.is_none() {
-            error!("open kv_store from {} failed", path.display());
-            return Err(Error::InitStore { location: location!(), path });
-        }
-
         // iter the files, build the hash_index for each file
-        
         // one mutable and multi immutable, only write to mutable
-        Ok(())
-    }
-
-    pub fn new() -> Self {
-        KvStore {
-            mem_store: HashMap::new(),
-        }
     }
 
     pub fn get(&self, key: String) -> Option<String> {
-        // query the mem store
-        self.mem_store.get(&key).cloned()
+        debug!("kv_store get, key:{}", key);
+        self.log_file.get(key)
     }
 
     pub fn set(&mut self, key: String, value: String) {
-        // first insert to file
-
-        // update in the mem
-        let _ = self.mem_store.insert(key, value);
+        debug!("kv_store set, key:{}, value:{}", key, value);
+        let _ = self.log_file.set(key.clone(), value.clone()).map_err(|e: log_file::Error| {
+            error!("kv store set failed, key:{}, value:{}, e:{}", 
+                key, value, e);
+        });
     }
 
     pub fn remove(&mut self, key: String) {
-        // first remove it in the mem
-
-        // remove it in the disk
-        let _ = self.mem_store.remove(&key);
+        debug!("kv_store rm, key:{}", key);
+        let _ = self.log_file.remove(key.clone()).map_err(|e: log_file::Error| {
+            error!("kv store rm failed, key:{}, e:{}", 
+                key, e);
+        });
     }
 }
 
 // get file paths and partition them
+#[allow(unused)]
 fn get_file_paths(path: impl AsRef<Path>) -> Option<(String, Vec<String>)> {
     let path = path.as_ref();
     if !path.exists() {
@@ -80,8 +88,7 @@ fn get_file_paths(path: impl AsRef<Path>) -> Option<(String, Vec<String>)> {
     {
         let f_name = String::from(entry.file_name().to_string_lossy());
         let f_path = String::from(entry.path().to_string_lossy());
-        
-        
+
         // todo should use reg to decide whether the file is valid
         if f_name.starts_with("mutable") {
             mut_file_path = f_path;
@@ -91,11 +98,13 @@ fn get_file_paths(path: impl AsRef<Path>) -> Option<(String, Vec<String>)> {
             warn!("invalid file:{} in data dir", f_path);
         }
     }
-    info!("mut_file_path:{:?}, imut_file_paths:{:?}", mut_file_path, imut_file_paths);
+    info!(
+        "mut_file_path:{:?}, imut_file_paths:{:?}",
+        mut_file_path, imut_file_paths
+    );
 
     Some((mut_file_path, imut_file_paths))
 }
-
 
 #[cfg(test)]
 mod tests {
