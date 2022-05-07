@@ -1,5 +1,7 @@
+use super::Error as LogFileError;
+use super::{log_item::LogItem, LogFile};
+use crate::log_file::log_item::LogEncoder;
 use log::info;
-use serde_derive::{Deserialize, Serialize};
 use snafu::{location, Location, OptionExt, ResultExt, Snafu};
 use std::{
     collections::HashMap,
@@ -11,24 +13,7 @@ use std::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("{} new log_file with invalid path {}", location, path.display()))]
-    InvalidPath {
-        location: Location,
-        path: PathBuf,
-    },
-
-    #[snafu(display("{} encode log {:?} failed: {}", location, log, source))]
-    EncodeLog {
-        source: serde_json::Error,
-        location: Location,
-        log: LogItem,
-    },
-
-    #[snafu(display("{} decode log {:?} failed: {}", location, json_str, source))]
-    DecodeLog {
-        source: serde_json::Error,
-        location: Location,
-        json_str: String,
-    },
+    InvalidPath { location: Location, path: PathBuf },
 
     #[snafu(display("{} write log {} failed: {}", location, json_str, source))]
     WriteFile {
@@ -51,14 +36,73 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[snafu(display("{} encoder failed: {}", location, source))]
+    LogEncoder {
+        source: super::log_item::Error,
+        location: Location,
+    },
+
+    #[snafu(display("{} remove non-exist key {}", location, key))]
+    RemoveNotExistKey { location: Location, key: String },
+
     #[snafu(display("{} unknown log {:?}", location, item))]
     UnknownCmd { location: Location, item: LogItem },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub struct ValueLogFile {
+    inner: ValueLogFileInner,
+}
+
+impl ValueLogFile {
+    pub fn new(path: &Path) -> Result<Self> {
+        Ok(ValueLogFile {
+            inner: ValueLogFileInner::new(path)?,
+        })
+    }
+}
+
+impl LogFile for ValueLogFile {
+    fn set(&mut self, key: String, value: String) -> super::Result<()> {
+        self.inner
+            .set(key, value)
+            .map_err(|e| LogFileError::LogFileSet {
+                source_str: format!("{}", e),
+                location: location!(),
+            })
+    }
+
+    fn get(&mut self, key: String) -> super::Result<Option<String>> {
+        Ok(self.inner.get(key))
+    }
+
+    fn remove(&mut self, key: String) -> super::Result<()> {
+        self.inner.remove(key).map_err(|e| LogFileError::LogFileRm {
+            source_str: format!("{}", e),
+            location: location!(),
+        })
+    }
+
+    fn scan(&mut self) -> super::Result<Vec<String>> {
+        unimplemented!()
+    }
+
+    fn len(&self) -> super::Result<u64> {
+        unimplemented!()
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.inner.cache.contains_key(key)
+    }
+
+    fn path(&self) -> PathBuf {
+        unimplemented!()
+    }
+}
+
 // log file //////////////////////////////////////////////////
-pub struct LogFile {
+pub struct ValueLogFileInner {
     cache: HashMap<String, String>,
     file: File,
     // path: PathBuf,
@@ -66,11 +110,14 @@ pub struct LogFile {
 }
 
 #[allow(unused)]
-impl LogFile {
-    pub fn new(path: &Path) -> Result<LogFile> {
+impl ValueLogFileInner {
+    pub fn new(path: &Path) -> Result<ValueLogFileInner> {
         // process before to assert path exist
         if !path.exists() {
-            return Err(Error::InvalidPath { location: location!(), path: path.into() });
+            return Err(Error::InvalidPath {
+                location: location!(),
+                path: path.into(),
+            });
         }
 
         // init cache
@@ -83,7 +130,7 @@ impl LogFile {
             .open(path)
             .context(OpenLogFileSnafu { path })?;
 
-        Ok(LogFile { cache, file })
+        Ok(ValueLogFileInner { cache, file })
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
@@ -99,10 +146,17 @@ impl LogFile {
 
     pub fn remove(&mut self, key: String) -> Result<()> {
         let item = LogItem::new("rm".to_owned(), key, None);
-        write_disk(&mut self.file, item.clone())?;
-        let _ = self.cache.remove(&item.key);
+        if self.cache.contains_key(&item.key) {
+            write_disk(&mut self.file, item.clone())?;
+            let _ = self.cache.remove(&item.key);
 
-        Ok(())
+            Ok(())
+        } else {
+            Err(Error::RemoveNotExistKey {
+                location: location!(),
+                key: item.key,
+            })
+        }
     }
 }
 
@@ -116,7 +170,7 @@ fn load_from_disk(path: impl AsRef<Path>) -> Result<HashMap<String, String>> {
     let mut cache = HashMap::new();
     for line in buffered.lines() {
         let json_str = line.context(ReadFileSnafu { path })?;
-        let item = LogEncoder::decode(&json_str).context(DecodeLogSnafu { json_str })?;
+        let item = LogEncoder::decode(&json_str).context(LogEncoderSnafu)?;
         match item.cmd.as_str() {
             "set" => {
                 let _ = cache.insert(
@@ -140,41 +194,11 @@ fn load_from_disk(path: impl AsRef<Path>) -> Result<HashMap<String, String>> {
 }
 
 fn write_disk(fout: &mut File, log: LogItem) -> Result<()> {
-    let json_str = LogEncoder::encode(&log).context(EncodeLogSnafu { log })? + "\n";
+    let json_str = LogEncoder::encode(&log).context(LogEncoderSnafu)? + "\n";
     fout.write_all(json_str.as_bytes())
         .context(WriteFileSnafu { json_str })?;
 
     Ok(())
-}
-
-// log //////////////////////////////////////////////////
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub struct LogItem {
-    cmd: String,
-    key: String,
-    #[serde(default)]
-    value: Option<String>,
-}
-
-#[allow(unused)]
-impl LogItem {
-    pub fn new(cmd: String, key: String, value: Option<String>) -> LogItem {
-        LogItem { cmd, key, value }
-    }
-}
-
-#[allow(unused)]
-pub struct LogEncoder;
-
-#[allow(unused)]
-impl LogEncoder {
-    pub fn encode(log: &LogItem) -> serde_json::Result<String> {
-        serde_json::to_string(log)
-    }
-
-    pub fn decode(json_str: &str) -> serde_json::Result<LogItem> {
-        serde_json::from_str(json_str)
-    }
 }
 
 #[cfg(test)]
@@ -184,15 +208,13 @@ mod tests {
         io::{BufRead, BufReader},
     };
 
-    use crate::kv_store::log_file::LogEncoder;
-
     // use assert_cmd::assert;
-    use super::{write_disk, LogFile, LogItem};
+    use super::{write_disk, LogEncoder, LogItem, ValueLogFileInner};
 
     #[test]
     fn crud() {
         let test_file = tempfile::NamedTempFile::new().unwrap();
-        let mut test_log_file = LogFile::new(test_file.path()).unwrap();
+        let mut test_log_file = ValueLogFileInner::new(test_file.path()).unwrap();
 
         // set
         let kv1 = ("key1".to_owned(), "value1".to_owned());
@@ -221,7 +243,7 @@ mod tests {
 
         // reopen to check replay
         drop(test_log_file);
-        let test_log_file = LogFile::new(test_file.path()).unwrap();
+        let test_log_file = ValueLogFileInner::new(test_file.path()).unwrap();
         let res1 = test_log_file.get(kv1.0.clone());
         let res2 = test_log_file.get(kv2.0.clone());
         let res3 = test_log_file.get(kv3.0.clone());
@@ -230,54 +252,6 @@ mod tests {
         assert!(res3.is_none());
         assert_eq!(res1.unwrap(), kv1.1);
         assert_eq!(res2.unwrap(), kv2.1);
-    }
-
-    #[test]
-    fn test_log_item_serde() {
-        // decode valid
-        let test_json1 = r#"
-        {
-            "cmd": "get",
-            "key": "key1",
-            "value": null
-        }
-        "#;
-        let test_log1 = LogEncoder::decode(test_json1).unwrap();
-        assert_eq!(test_log1.cmd, "get");
-        assert_eq!(test_log1.key, "key1");
-        assert!(test_log1.value.is_none());
-
-        // decode invalid
-        let test_json2 = r#"
-        {
-            "cmd": "get",
-            "inv_key": "key1",
-            "inv_value": null,
-        }
-        "#;
-        let test_log2 = LogEncoder::decode(test_json2);
-        assert!(test_log2.is_err());
-
-        // encode
-        let test_log3 = LogItem::new(
-            "set".to_owned(),
-            "key2".to_owned(),
-            Some("value2".to_owned()),
-        );
-
-        let test_log4 = LogItem::new("get".to_owned(), "key3".to_owned(), None);
-        let res3 = LogEncoder::encode(&test_log3);
-        let res4 = LogEncoder::encode(&test_log4);
-        assert!(res3.is_ok());
-        assert!(res4.is_ok());
-        let test_json3 = res3.unwrap();
-        let test_json4 = res4.unwrap();
-        assert!(test_json3.contains("set"));
-        assert!(test_json3.contains("key2"));
-        assert!(test_json3.contains("value2"));
-        assert!(test_json4.contains("get"));
-        assert!(test_json4.contains("key3"));
-        assert!(test_json4.contains("null"));
     }
 
     #[test]
